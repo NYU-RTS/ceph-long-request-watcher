@@ -1,6 +1,6 @@
 use futures;
 use once_cell::sync::Lazy;
-use prometheus::{Gauge, Opts};
+use prometheus::{GaugeVec, Opts};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::env::args_os;
@@ -40,6 +40,18 @@ impl<T, E: std::fmt::Display> OrExitExt<T> for Result<T, E> {
             Ok(value) => value,
             Err(e) => {
                 error!("{}: {}", message, e);
+                exit(1);
+            }
+        }
+    }
+}
+
+impl<T> OrExitExt<T> for Option<T> {
+    fn or_exit(self, message: &str) -> T {
+        match self {
+            Some(value) => value,
+            None => {
+                error!("{}", message);
                 exit(1);
             }
         }
@@ -102,18 +114,17 @@ Options:
 
     let data: Arc<Mutex<PromData>> = Arc::new(Mutex::new(PromData {
         updated: Instant::now(),
-        osd_requests: HashMap::new(),
-        mds_requests: HashMap::new(),
+        clusters: HashMap::new(),
     }));
 
     // Set up Prometheus
     let longest_opts = Opts::new("longest_request_seconds", "Duration of longest request");
-    let longest_metric = Gauge::with_opts(longest_opts).unwrap();
+    let longest_metric = GaugeVec::new(longest_opts, &["cluster_id"]).unwrap();
     prometheus::default_registry()
         .register(Box::new(longest_metric.clone()))
         .unwrap();
     let longest_mds_opts = Opts::new("longest_mds_request_seconds", "Duration of longest MDS request");
-    let longest_mds_metric = Gauge::with_opts(longest_mds_opts).unwrap();
+    let longest_mds_metric = GaugeVec::new(longest_mds_opts, &["cluster_id"]).unwrap();
     prometheus::default_registry()
         .register(Box::new(longest_mds_metric.clone()))
         .unwrap();
@@ -148,35 +159,39 @@ Options:
 
                     let mut buffer = Vec::new();
 
-                    writeln!(buffer, "OSD:").unwrap();
-                    let mut requests: Vec<_> = data.osd_requests.values().collect();
-                    requests.sort_by(|&(target1, since1), &(target2, since2)| {
-                        since2.cmp(since1).then(target1.cmp(target2))
-                    });
-                    for (target, since) in requests {
-                        writeln!(
-                            buffer, "osd.{:<5} {:>5.1} second",
-                            target,
-                            data.updated.duration_since(*since).as_secs_f64(),
-                        ).unwrap();
-                    }
+                    for (cluster_id, cluster) in &data.clusters {
+                        writeln!(buffer, "Cluster {}", cluster_id).unwrap();
 
-                    writeln!(buffer, "MDS:").unwrap();
-                    let mut requests: Vec<_> = data.mds_requests.values().collect();
-                    requests.sort_by(|&(target1, since1), &(target2, since2)| {
-                        since2.cmp(since1).then(target1.cmp(target2))
-                    });
-                    for (target, since) in requests {
-                        match target {
-                            Some(target) => writeln!(
-                                buffer, "mds{} {:.1} second",
+                        writeln!(buffer, "OSD:").unwrap();
+                        let mut requests: Vec<_> = cluster.osd_requests.values().collect();
+                        requests.sort_by(|&(target1, since1), &(target2, since2)| {
+                            since2.cmp(since1).then(target1.cmp(target2))
+                        });
+                        for (target, since) in requests {
+                            writeln!(
+                                buffer, "osd.{:<5} {:>5.1} second",
                                 target,
                                 data.updated.duration_since(*since).as_secs_f64(),
-                            ).unwrap(),
-                            None => writeln!(
-                                buffer, "(none) {:.1} second",
-                                data.updated.duration_since(*since).as_secs_f64(),
-                            ).unwrap(),
+                            ).unwrap();
+                        }
+
+                        writeln!(buffer, "MDS:").unwrap();
+                        let mut requests: Vec<_> = cluster.mds_requests.values().collect();
+                        requests.sort_by(|&(target1, since1), &(target2, since2)| {
+                            since2.cmp(since1).then(target1.cmp(target2))
+                        });
+                        for (target, since) in requests {
+                            match target {
+                                Some(target) => writeln!(
+                                    buffer, "mds{} {:.1} second",
+                                    target,
+                                    data.updated.duration_since(*since).as_secs_f64(),
+                                ).unwrap(),
+                                None => writeln!(
+                                    buffer, "(none) {:.1} second",
+                                    data.updated.duration_since(*since).as_secs_f64(),
+                                ).unwrap(),
+                            }
                         }
                     }
 
@@ -211,28 +226,37 @@ Options:
 
 struct PromData {
     updated: Instant,
+    clusters: HashMap<String, ClusterData>,
+}
+
+#[derive(Default)]
+struct ClusterData {
     osd_requests: HashMap<u64, (u32, Instant)>,
     mds_requests: HashMap<u64, (Option<u32>, Instant)>,
 }
 
+#[derive(Default)]
+struct Seen {
+    longest_osd: f64,
+    longest_mds: f64,
+    osd_tids: HashSet<u64>,
+    mds_tids: HashSet<u64>,
+}
+
 fn update_data(
     data: &mut PromData,
-    longest_metric: &Gauge,
-    longest_mds_metric: &Gauge,
+    longest_metric: &GaugeVec,
+    longest_mds_metric: &GaugeVec,
     debugfs: &Path,
     no_ceph_ok: bool,
 ) {
-    let mut seen_osd_tids: HashSet<u64> = HashSet::new();
-    let mut seen_mds_tids: HashSet<u64> = HashSet::new();
+    let mut seen: HashMap<String, Seen> = HashMap::new();
     let &mut PromData {
         ref mut updated,
-        ref mut osd_requests,
-        ref mut mds_requests,
+        ref mut clusters,
     } = &mut *data;
 
     *updated = Instant::now();
-    let mut longest_osd: f64 = 0.0;
-    let mut longest_mds: f64 = 0.0;
 
     // Loop on clients
     let dir = match read_dir(&debugfs) {
@@ -241,6 +265,30 @@ fn update_data(
     }.or_exit("Error reading debug filesystem");
     for client in dir {
         let client = client.or_exit("Error reading debug filesystem").path();
+
+        let (cluster_id, _) = client.file_name().unwrap()
+            .to_str().unwrap()
+            .split_once('.')
+            .or_exit("Error reading debug filesystem");
+        let cluster = match clusters.get_mut(cluster_id) {
+            Some(c) => c,
+            None => clusters.entry(cluster_id.to_owned()).insert_entry(Default::default()).into_mut(),
+        };
+        let ClusterData {
+            ref mut osd_requests,
+            ref mut mds_requests,
+        } = &mut *cluster;
+
+        let seen_cluster = match seen.get_mut(cluster_id) {
+            Some(c) => c,
+            None => seen.entry(cluster_id.to_owned()).insert_entry(Default::default()).into_mut(),
+        };
+        let Seen {
+            ref mut longest_osd,
+            ref mut longest_mds,
+            ref mut osd_tids,
+            ref mut mds_tids,
+        } = &mut *seen_cluster;
 
         // Read OSD requests from osdc
         {
@@ -252,13 +300,13 @@ fn update_data(
                 match osd_requests.entry(request.tid) {
                     std::collections::hash_map::Entry::Occupied(value) => {
                         let (_, first_seen) = *value.get();
-                        longest_osd = longest_osd.max(updated.duration_since(first_seen).as_secs_f64());
+                        *longest_osd = longest_osd.max(updated.duration_since(first_seen).as_secs_f64());
                     }
                     std::collections::hash_map::Entry::Vacant(value) => {
                         value.insert((request.target, *updated));
                     }
                 }
-                seen_osd_tids.insert(request.tid);
+                osd_tids.insert(request.tid);
             }
         }
 
@@ -277,25 +325,32 @@ fn update_data(
                     match mds_requests.entry(request.tid) {
                         std::collections::hash_map::Entry::Occupied(value) => {
                             let (_, first_seen) = *value.get();
-                            longest_mds = longest_mds.max(updated.duration_since(first_seen).as_secs_f64());
+                            *longest_mds = longest_mds.max(updated.duration_since(first_seen).as_secs_f64());
                         }
                         std::collections::hash_map::Entry::Vacant(value) => {
                             value.insert((request.target, *updated));
                         }
                     }
-                    seen_mds_tids.insert(request.tid);
+                    mds_tids.insert(request.tid);
                 }
             }
         }
     }
 
-    // Forget unseen requests
-    osd_requests.retain(|k, _| seen_osd_tids.contains(k));
-    mds_requests.retain(|k, _| seen_mds_tids.contains(k));
+    // Forget unseen requests, set metrics
+    for cluster_id in clusters.keys().cloned().collect::<Vec<String>>() {
+        if let Some(seen_cluster) = seen.get(&cluster_id) {
+            let cluster = clusters.get_mut(&cluster_id).unwrap();
+            cluster.osd_requests.retain(|k, _| seen_cluster.osd_tids.contains(k));
+            cluster.mds_requests.retain(|k, _| seen_cluster.mds_tids.contains(k));
 
-    // Set metrics
-    longest_metric.set(longest_osd);
-    longest_mds_metric.set(longest_mds);
+            longest_metric.with_label_values(&[&cluster_id]).set(seen_cluster.longest_osd);
+            longest_mds_metric.with_label_values(&[&cluster_id]).set(seen_cluster.longest_mds);
+        } else {
+            clusters.remove(&cluster_id);
+            longest_metric.remove_label_values(&[&cluster_id]).unwrap();
+        }
+    }
 }
 
 fn get_num_from_regex<F: std::str::FromStr>(m: Option<regex::Match>) -> Result<F, IoError> {
